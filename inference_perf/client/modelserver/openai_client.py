@@ -86,7 +86,6 @@ class openAIModelServerClient(ModelServerClient):
             headers.update(self.api_config.headers)
 
         request_data = json.dumps(payload)
-
         timeout = aiohttp.ClientTimeout(total=self.timeout) if self.timeout else aiohttp.helpers.sentinel
 
         async with aiohttp.ClientSession(

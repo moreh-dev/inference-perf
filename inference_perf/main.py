@@ -53,7 +53,11 @@ from inference_perf.reportgen import ReportGenerator
 from inference_perf.utils import CustomTokenizer, ReportFile
 from inference_perf.logger import setup_logging
 import asyncio
+import logging
+import os
 import time
+
+logger = logging.getLogger(__name__)
 
 
 class InferencePerfRunner:
@@ -104,6 +108,9 @@ def main_cli() -> None:
     args = parser.parse_args()
 
     setup_logging(args.log_level)
+    
+    # Get logger after setup_logging is called
+    _logger = logging.getLogger(__name__)
 
     if args.analyze:
         analyze_reports(args.analyze)
@@ -271,8 +278,12 @@ def main_cli() -> None:
             isinstance(metrics_client, PrometheusMetricsClient)
             and config.report.prometheus
             and config.report.prometheus.per_stage
+            and config.load.interval > 0  # Only set interval if not explicitly disabled (0)
         ):
-            config.load.interval = max(config.load.interval, metrics_client.scrape_interval)
+            # Only set interval to scrape_interval if interval is at default value (1.0)
+            # This allows users to set interval to 0 to skip wait, or a custom value
+            if config.load.interval == 1.0:  # Default interval value
+                config.load.interval = max(config.load.interval, metrics_client.scrape_interval)
         loadgen = LoadGenerator(datagen, config.load)
     else:
         raise Exception("load config missing")
@@ -303,6 +314,7 @@ def main_cli() -> None:
     perfrunner.save_reports(reports=reports)
 
     perfrunner.stop()
+
 
 
 if __name__ == "__main__":
