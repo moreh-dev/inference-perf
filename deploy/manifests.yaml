@@ -12,7 +12,7 @@ spec:
     spec:
       containers:
         - name: inference-perf
-          image: quay.io/inference-perf/inference-perf:latest
+          image: quay.io/inference-perf/inference-perf:sha-e8e0aa9
           imagePullPolicy: Always
           command: ["inference-perf"]
           args: ["--config_file", "/etc/config/config.yml"]
@@ -23,12 +23,20 @@ spec:
                   name: hf-secret
                   key: hf_api_token
                   optional: true
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf-cache"
+            - name: HF_HOME
+              value: "/tmp/hf-cache"
           volumeMounts:
             - name: config-volume
               mountPath: /etc/config
               readOnly: true
+            - name: hf-cache
+              mountPath: /tmp/hf-cache
       restartPolicy: Never
       volumes:
         - name: config-volume
           configMap:
             name: inference-perf-config
+        - name: hf-cache
+          emptyDir: {}

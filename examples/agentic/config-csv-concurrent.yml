@@ -1,0 +1,31 @@
+data:
+  type: agentic_csv
+  agentic_csv:
+    path: ./examples/agentic/sample_trace.csv
+
+load:
+  type: agentic_concurrent
+  session_arrival:
+    type: constant
+    stages:
+    - active_sessions: 10
+      duration: 300
+
+  agentic:
+    tool_call_delay:
+      type: replay
+    user_think_delay:
+      type: zero
+
+api:
+  type: chat
+server:
+  type: vllm
+  model_name: meta-llama/Llama-3-8B-Instruct
+  base_url: http://localhost:8000
+
+report:
+  request_lifecycle:
+    summary: true
+    session_summary: true
+    per_turn_position: true

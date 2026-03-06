@@ -1,0 +1,57 @@
+data:
+  type: agentic_synthetic
+  agentic_synthetic:
+    num_sessions: 500
+    turns_per_session:
+      type: normal
+      mean: 3
+      std_dev: 1.5
+      min: 1
+      max: 8
+    tool_call_probability: 0.6
+    input_tokens_turn_0:
+      type: normal
+      mean: 800
+      std_dev: 300
+      min: 200
+      max: 2000
+    output_tokens_per_turn:
+      type: normal
+      mean: 100
+      std_dev: 50
+      min: 20
+      max: 300
+    tool_result_tokens:
+      type: normal
+      mean: 80
+      std_dev: 40
+      min: 10
+      max: 200
+    system_prompt_tokens: 512
+
+load:
+  type: agentic
+  session_arrival:
+    type: constant
+    stages:
+    - rate: 5
+      duration: 120
+  agentic:
+    tool_call_delay:
+      type: fixed
+      fixed_ms: 200
+    user_think_delay:
+      type: zero
+
+api:
+  type: chat
+server:
+  type: vllm
+  model_name: meta-llama/Llama-3-8B-Instruct
+  base_url: http://localhost:8000
+
+report:
+  request_lifecycle:
+    summary: true
+    session_summary: true
+    per_turn_position: true

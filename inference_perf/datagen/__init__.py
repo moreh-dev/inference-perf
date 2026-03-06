@@ -20,6 +20,8 @@ from .shared_prefix_datagen import SharedPrefixDataGenerator
 from .cnn_dailymail_datagen import CNNDailyMailDataGenerator
 from .infinity_instruct_datagen import InfinityInstructDataGenerator
 from .hf_billsum_datagen import BillsumConversationsDataGenerator
+from .agentic_csv_datagen import AgenticCsvDataGenerator
+from .agentic_synthetic_datagen import AgenticSyntheticDataGenerator
 
 __all__ = [
     "DataGenerator",
@@ -31,4 +33,6 @@ __all__ = [
     "CNNDailyMailDataGenerator",
     "InfinityInstructDataGenerator",
     "BillsumConversationsDataGenerator",
+    "AgenticCsvDataGenerator",
+    "AgenticSyntheticDataGenerator",
 ]

@@ -13,9 +13,10 @@
 # limitations under the License.
 from argparse import ArgumentParser
 from inference_perf.analysis.analyze import analyze_reports
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from inference_perf.client.modelserver.tgi_client import TGImodelServerClient
-from inference_perf.loadgen import LoadGenerator
+from inference_perf.loadgen import LoadGenerator, AgenticLoadGenerator
+from inference_perf.loadgen.session_runner import SessionResult
 from inference_perf.config import (
     DataGenType,
     LoadType,
@@ -24,6 +25,7 @@ from inference_perf.config import (
     ReportConfig,
     StandardLoadStage,
     ConcurrentLoadStage,
+    RetentionPolicyConfig,
     read_config,
 )
 from inference_perf.datagen import (
@@ -36,6 +38,8 @@ from inference_perf.datagen import (
     CNNDailyMailDataGenerator,
     InfinityInstructDataGenerator,
     BillsumConversationsDataGenerator,
+    AgenticCsvDataGenerator,
+    AgenticSyntheticDataGenerator,
 )
 from inference_perf.client.modelserver import (
     ModelServerClient,
@@ -58,10 +62,19 @@ from inference_perf.client.requestdatacollector import (
 )
 from inference_perf.circuit_breaker import init_circuit_breakers
 from inference_perf.reportgen import ReportGenerator
+from inference_perf.reportgen.base import summarize
+from inference_perf.policies import ContinuumPolicy, NoopPolicy
 from inference_perf.utils import CustomTokenizer, ReportFile
+from inference_perf.utils.content_generator import ContentGenerator
+from inference_perf.metrics import SessionMetrics, TurnPositionMetrics
 from inference_perf.logger import setup_logging
 import asyncio
+import logging
 import time
+
+logger = logging.getLogger(__name__)
+
+AGENTIC_LOAD_TYPES = {LoadType.AGENTIC, LoadType.AGENTIC_CONCURRENT, LoadType.AGENTIC_TRACE_REPLAY}
 
 
 class InferencePerfRunner:
@@ -97,6 +110,74 @@ class InferencePerfRunner:
         asyncio.run(self.loadgen.stop())
 
 
+def generate_session_reports(
+    session_results: List[SessionResult],
+    report_config: ReportConfig,
+) -> List[ReportFile]:
+    """Generate session-level reports from agentic workload results."""
+    reports: List[ReportFile] = []
+
+    # Build SessionMetrics from results
+    session_metrics_list = [
+        SessionMetrics.from_session_result(sr)
+        for sr in session_results
+    ]
+
+    # Session summary report
+    if report_config.request_lifecycle.session_summary:
+        latencies = [m.session_latency_ms for m in session_metrics_list]
+        inference_times = [m.session_inference_time_ms for m in session_metrics_list]
+        duty_cycles = [m.inference_duty_cycle for m in session_metrics_list]
+        turns = [float(m.turns_completed) for m in session_metrics_list]
+        peak_contexts = [float(m.peak_context_length) for m in session_metrics_list]
+
+        summary: Dict[str, Any] = {
+            "total_sessions": len(session_metrics_list),
+            "session_latency_ms": summarize(latencies),
+            "session_inference_time_ms": summarize(inference_times),
+            "inference_duty_cycle": summarize(duty_cycles),
+            "turns_completed": summarize(turns),
+            "peak_context_length": summarize(peak_contexts),
+        }
+
+        # Throughput
+        if session_results:
+            total_wall_time = max(sr.end_time for sr in session_results) - min(sr.start_time for sr in session_results)
+            if total_wall_time > 0:
+                summary["session_throughput"] = len(session_results) / total_wall_time
+                total_turns = sum(sr.turns_completed for sr in session_results)
+                summary["effective_request_rate"] = total_turns / total_wall_time
+
+        reports.append(ReportFile(
+            name="session_summary_metrics",
+            contents=summary,
+        ))
+
+    # Per-turn-position report
+    if report_config.request_lifecycle.per_turn_position:
+        max_turns = max((m.turns_total for m in session_metrics_list), default=0)
+        turn_position_data = []
+
+        for turn_idx in range(max_turns):
+            tpm = TurnPositionMetrics.from_session_metrics_list(turn_idx, session_metrics_list)
+            if tpm.count > 0:
+                turn_position_data.append(tpm.to_dict())
+
+        reports.append(ReportFile(
+            name="per_turn_position_metrics",
+            contents=turn_position_data,
+        ))
+
+    # Per-session report
+    if report_config.request_lifecycle.per_session:
+        reports.append(ReportFile(
+            name="per_session_metrics",
+            contents=[m.to_dict() for m in session_metrics_list],
+        ))
+
+    return reports
+
+
 def main_cli() -> None:
     # Parse command line arguments
     parser = ArgumentParser()
@@ -118,18 +199,15 @@ def main_cli() -> None:
 
     config = read_config(args.config_file)
 
+    is_agentic = config.load.type in AGENTIC_LOAD_TYPES
+
     # Set stage rates to high values if using concurrent load type
     if config.load.type == LoadType.CONCURRENT:
-        # The validation is now handled by Pydantic in the config classes
-        # Convert ConcurrentLoadStage to have rate/duration for load generation
         for stage in config.load.stages:
             if isinstance(stage, ConcurrentLoadStage):
-                # Generate all of the requests in the span of a second (enqueuing everything) to saturate workers
                 stage.duration = 1
                 stage.rate = stage.num_requests
-        # Set to 0 to show that worker_max_concurrency was not relevant in concurrent load type
         config.load.worker_max_concurrency = 0
-    # Note: StandardLoadStage validation is automatically handled by Pydantic
 
     # Define Circuit Breakers
     if config.circuit_breakers:
@@ -186,7 +264,6 @@ def main_cli() -> None:
                 api_key=config.server.api_key,
                 timeout=config.load.request_timeout,
             )
-            # vllm_client supports inferring the tokenizer
             tokenizer = model_server_client.tokenizer
         if config.server.type == ModelServerType.SGLANG:
             model_server_client = SGlangModelServerClient(
@@ -201,7 +278,6 @@ def main_cli() -> None:
                 api_key=config.server.api_key,
                 timeout=config.load.request_timeout,
             )
-            # sglang_client supports inferring the tokenizer
             tokenizer = model_server_client.tokenizer
         if config.server.type == ModelServerType.TGI:
             model_server_client = TGImodelServerClient(
@@ -216,7 +292,6 @@ def main_cli() -> None:
                 api_key=config.server.api_key,
                 timeout=config.load.request_timeout,
             )
-            # tgi_client supports inferring the tokenizer
             tokenizer = model_server_client.tokenizer
         if config.server.type == ModelServerType.MOCK:
             model_server_client = MockModelServerClient(
@@ -228,8 +303,101 @@ def main_cli() -> None:
     else:
         raise Exception("model server client config missing")
 
-    # Check load exists so datagen can derive total_count from the
-    # stage configurations.
+    # --- Agentic workload path ---
+    if is_agentic:
+        if tokenizer is None:
+            raise Exception("Agentic workloads require a configured tokenizer")
+
+        # Load sessions from data source
+        if config.data.type == DataGenType.AgenticCsv:
+            if config.data.agentic_csv is None:
+                raise Exception("agentic_csv configuration is required for agentic_csv data type")
+            agentic_datagen = AgenticCsvDataGenerator(config.data.agentic_csv)
+        elif config.data.type == DataGenType.AgenticSynthetic:
+            if config.data.agentic_synthetic is None:
+                raise Exception("agentic_synthetic configuration is required for agentic_synthetic data type")
+            agentic_datagen = AgenticSyntheticDataGenerator(config.data.agentic_synthetic)
+        else:
+            raise Exception(f"Unsupported agentic data type: {config.data.type.value}")
+
+        sessions = agentic_datagen.get_sessions()
+        content_generator = ContentGenerator(tokenizer)
+
+        # Build retention policy from config
+        retention_policy = None
+        system_prompt_tokens = 0
+        if config.load.retention and config.load.retention.type == "continuum":
+            rc = config.load.retention
+            retention_policy = ContinuumPolicy(
+                system_prompt_priority=rc.system_prompt_priority,
+                history_priority=rc.history_priority,
+                tail_priority=rc.tail_priority,
+                tail_fraction=rc.tail_fraction,
+                ttl_buffer_s=rc.ttl_buffer_s,
+            )
+            # Get system_prompt_tokens from data config
+            if config.data.agentic_synthetic:
+                system_prompt_tokens = config.data.agentic_synthetic.system_prompt_tokens
+            logger.info(
+                f"Retention policy: continuum (priorities={rc.system_prompt_priority}/"
+                f"{rc.history_priority}/{rc.tail_priority}, "
+                f"tail_fraction={rc.tail_fraction}, ttl_buffer={rc.ttl_buffer_s}s)"
+            )
+
+        agentic_loadgen = AgenticLoadGenerator(
+            sessions=sessions,
+            load_config=config.load,
+            api_config=config.api,
+            content_generator=content_generator,
+            retention_policy=retention_policy,
+            system_prompt_tokens=system_prompt_tokens,
+        )
+
+        start_time = time.time()
+
+        # Run agentic load test
+        asyncio.run(agentic_loadgen.run(model_server_client))
+
+        end_time = time.time()
+        duration = end_time - start_time
+
+        logger.info(f"Agentic benchmark completed in {duration:.1f}s")
+
+        # Generate session-level reports
+        session_results = agentic_loadgen.get_all_session_results()
+        reports = generate_session_reports(session_results, config.report)
+
+        # Also generate standard request lifecycle reports from the collector
+        # (only if the collector was started — agentic path may skip it)
+        try:
+            request_metrics = [
+                metric for metric in reportgen.get_metrics_collector().get_metrics()
+                if metric.stage_id is not None and metric.stage_id >= 0
+            ]
+            if request_metrics:
+                from inference_perf.reportgen.base import summarize_requests
+                reports.append(ReportFile(
+                    name="summary_lifecycle_metrics",
+                    contents=summarize_requests(request_metrics).model_dump(),
+                ))
+        except AttributeError:
+            logger.debug("Skipping lifecycle metrics — collector not started in agentic path")
+
+        # Add config report
+        reports.append(ReportFile(
+            name="config",
+            file_type="yaml",
+            contents=config.model_dump(mode="json"),
+        ))
+
+        # Save reports
+        for storage_client in storage_clients:
+            storage_client.save_report(reports)
+
+        return
+
+    # --- Standard (non-agentic) path ---
+
     if config.load is None:
         raise Exception("load config missing")
 
@@ -239,7 +407,6 @@ def main_cli() -> None:
     # Define DataGenerator
     datagen: DataGenerator
     if config.data:
-        # Common checks for generators that require a tokenizer / distribution
         if config.data.type in set(
             {
                 DataGenType.ShareGPT,
@@ -267,7 +434,6 @@ def main_cli() -> None:
                         f"{config.data.type.value} data generator requires 'output_distribution' to be configured if no trace config is provided"
                     )
 
-                # Calculate total count based on stage type
                 max_requests = 0
                 for stage in config.load.stages:
                     if isinstance(stage, StandardLoadStage):
@@ -316,7 +482,7 @@ def main_cli() -> None:
     perfrunner.run()
 
     end_time = time.time()
-    duration = end_time - start_time  # Calculate the duration of the test
+    duration = end_time - start_time
 
     # Generate Reports after the tests
     reports = perfrunner.generate_reports(

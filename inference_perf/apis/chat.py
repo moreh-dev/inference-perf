@@ -15,7 +15,7 @@
 import json
 import time
 
-from typing import Any, List
+from typing import Any, List, Optional
 from aiohttp import ClientResponse
 from pydantic import BaseModel
 from inference_perf.apis import InferenceAPIData, InferenceInfo
@@ -25,12 +25,17 @@ from inference_perf.config import APIConfig, APIType
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[dict]] = None
+    id: Optional[str] = None
 
 
 class ChatCompletionAPIData(InferenceAPIData):
     messages: List[ChatMessage]
     max_tokens: int = 0
+    program_id: Optional[str] = None
+    turn_index: Optional[int] = None
+    extra_body: Optional[dict[str, Any]] = None
 
     def get_api_type(self) -> APIType:
         return APIType.Chat
@@ -41,13 +46,28 @@ class ChatCompletionAPIData(InferenceAPIData):
     def to_payload(self, model_name: str, max_tokens: int, ignore_eos: bool, streaming: bool) -> dict[str, Any]:
         if self.max_tokens == 0:
             self.max_tokens = max_tokens
-        return {
+
+        messages = []
+        for m in self.messages:
+            msg: dict[str, Any] = {"role": m.role}
+            if m.content is not None:
+                msg["content"] = m.content
+            if m.tool_calls is not None:
+                msg["tool_calls"] = m.tool_calls
+            if m.id is not None:
+                msg["tool_call_id"] = m.id
+            messages.append(msg)
+
+        payload = {
             "model": model_name,
-            "messages": [{"role": m.role, "content": m.content} for m in self.messages],
+            "messages": messages,
             "max_tokens": self.max_tokens,
             "ignore_eos": ignore_eos,
             "stream": streaming,
         }
+        if self.extra_body:
+            payload.update(self.extra_body)
+        return payload
 
     async def process_response(self, response: ClientResponse, config: APIConfig, tokenizer: CustomTokenizer) -> InferenceInfo:
         if config.streaming:
@@ -78,7 +98,7 @@ class ChatCompletionAPIData(InferenceAPIData):
                         continue
                     break
 
-            prompt_text = "".join([msg.content for msg in self.messages if msg.content])
+            prompt_text = "".join([msg.content for msg in self.messages if msg.content is not None])
             prompt_len = tokenizer.count_tokens(prompt_text)
             output_len = tokenizer.count_tokens(output_text)
             return InferenceInfo(
@@ -88,7 +108,7 @@ class ChatCompletionAPIData(InferenceAPIData):
             )
         else:
             data = await response.json()
-            prompt_len = tokenizer.count_tokens("".join([m.content for m in self.messages]))
+            prompt_len = tokenizer.count_tokens("".join([m.content for m in self.messages if m.content is not None]))
             choices = data.get("choices", [])
             if len(choices) == 0:
                 return InferenceInfo(input_tokens=prompt_len)

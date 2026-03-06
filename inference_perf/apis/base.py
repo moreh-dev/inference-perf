@@ -40,6 +40,8 @@ class RequestLifecycleMetric(BaseModel):
     response_data: Optional[str] = None
     info: InferenceInfo
     error: Optional[ErrorResponseInfo]
+    program_id: Optional[str] = None
+    turn_index: Optional[int] = None
 
 
 class InferenceAPIData(BaseModel):
