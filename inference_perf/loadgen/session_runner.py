@@ -270,6 +270,7 @@ class SessionRunner:
                 turn=turn,
                 context_tokens=turn.input_tokens,
                 system_prompt_tokens=self.system_prompt_tokens,
+                scope=self.session.session_id,
             )
             if extra:
                 request.extra_body = extra
