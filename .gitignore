@@ -175,3 +175,5 @@ cython_debug/
 
 # Test Reports (directories)
 reports-*/
+
+uv.lock
