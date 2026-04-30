@@ -112,7 +112,8 @@ class ChatCompletionAPIData(InferenceAPIData):
             choices = data.get("choices", [])
             if len(choices) == 0:
                 return InferenceInfo(input_tokens=prompt_len)
-            output_text = "".join([choice.get("message", {}).get("content", "") for choice in choices])
+            # message.content can be null when the assistant returns only tool_calls
+            output_text = "".join([(choice.get("message") or {}).get("content") or "" for choice in choices])
             output_len = tokenizer.count_tokens(output_text)
             return InferenceInfo(
                 input_tokens=prompt_len,
