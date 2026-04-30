@@ -93,6 +93,10 @@ class DistributionParams(BaseModel):
 class AgenticSyntheticConfig(BaseModel):
     """Configuration for synthetic agentic session generation."""
     num_sessions: int = Field(default=100, gt=0, description="Number of sessions to generate")
+    seed: Optional[int] = Field(
+        default=None,
+        description="Random seed for reproducible session generation. None = nondeterministic.",
+    )
     turns_per_session: DistributionParams = Field(
         default_factory=lambda: DistributionParams(type="normal", mean=5, std_dev=2, min=1, max=20),
         description="Distribution for number of turns per session"

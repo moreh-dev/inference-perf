@@ -58,6 +58,9 @@ class AgenticSyntheticDataGenerator:
         self.config = config
         self.sessions: List[Session] = []
 
+        if config.seed is not None:
+            random.seed(config.seed)
+
         self._generate_sessions()
 
         avg_turns = sum(s.num_turns for s in self.sessions) / len(self.sessions)
