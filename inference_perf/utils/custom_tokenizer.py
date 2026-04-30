@@ -24,7 +24,11 @@ class CustomTokenizer:
     def count_tokens(self, text: str) -> int:
         if text == "":
             return 0
-        return len(self.tokenizer(text, truncation=True, max_length=self.tokenizer.model_max_length).input_ids)
+        # Some HF tokenizers (e.g. gpt-oss) report model_max_length as 1e30 to mean "no limit",
+        # which overflows the underlying Rust tokenizer's int conversion. Clamp to a value
+        # large enough for any realistic request but safe for the C/Rust int type.
+        max_length = min(self.tokenizer.model_max_length, 1_000_000)
+        return len(self.tokenizer(text, truncation=True, max_length=max_length).input_ids)
 
     def get_tokenizer(self) -> PreTrainedTokenizerBase:
         return self.tokenizer
