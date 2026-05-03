@@ -232,12 +232,16 @@ def main_cli() -> None:
         if config.storage.simple_storage_service:
             storage_clients.append(SimpleStorageServiceClient(config=config.storage.simple_storage_service))
 
-    # Define Report Generator
+    # Define Report Generator.
+    # Agentic path runs entirely in one process (asyncio tasks within main_cli),
+    # so use the in-process collector. The multiprocess one spawns a non-daemon
+    # mp.JoinableQueue feeder thread; in agentic path nobody drains the queue,
+    # so the feeder thread blocks process exit forever after the bench ends.
     collector: RequestDataCollector
-    if config.load.num_workers > 0:
-        collector = MultiprocessRequestDataCollector()
-    else:
+    if is_agentic or config.load.num_workers <= 0:
         collector = LocalRequestDataCollector()
+    else:
+        collector = MultiprocessRequestDataCollector()
     reportgen = ReportGenerator(metrics_client, collector, config=config)
 
     # Create tokenizer based on tokenizer config
