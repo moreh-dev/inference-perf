@@ -85,14 +85,21 @@ def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
         segs = []
         for b in sorted({t for t, _ in lst}):
             covering = [(t, cs) for t, cs in lst if t >= b]
-            farthest_start = max(cs for _, cs in covering)
-            # Spans running during the idle window (producer end -> farthest
-            # reuse start); the policy turns this count into a TTL.
-            intervening = sum(1 for st in all_starts if prod_end < st < farthest_start)
+            # Longest run of spans this region goes untouched between consecutive
+            # uses (producer end, then each covering reuse start). Frequent reuse
+            # (recency-hot) -> small cold_gap; a genuine set-aside -> large. The
+            # policy turns this into a TTL, so hot regions are not over-retained
+            # (using gap-to-FARTHEST-reuse here would conflate the two).
+            marks = sorted([prod_end] + [cs for _, cs in covering])
+            cold_gap = max(
+                (sum(1 for st in all_starts if marks[i] < st < marks[i + 1])
+                 for i in range(len(marks) - 1)),
+                default=0,
+            )
             segs.append(ReuseSegment(
                 start=prev, end=b,
                 breadth=len(covering),
-                intervening_spans=intervening,
+                cold_gap=cold_gap,
             ))
             prev = b
         profiles[sid] = segs
