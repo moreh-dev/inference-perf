@@ -50,6 +50,8 @@ class WorkflowAwarePolicy:
         low_breadth_priority: int = 50,
         per_span_s: float = 9.0,
         queue_margin_s: float = 10.0,
+        min_breadth: int = 0,
+        min_remaining_reuse: int = 0,
         render_url: str | None = None,
     ) -> None:
         self.ttl_buffer_s = ttl_buffer_s
@@ -58,6 +60,14 @@ class WorkflowAwarePolicy:
         self.low_breadth_priority = low_breadth_priority
         self.per_span_s = per_span_s
         self.queue_margin_s = queue_margin_s
+        # Emission gate: skip directives when the producer's best reuse breadth
+        # is below this (0 = off) — few reusers do not justify a budget slot.
+        self.min_breadth = min_breadth
+        # Remaining-reuse gate: skip when this prompt is reused fewer than
+        # min_remaining_reuse more times downstream (0 = off). Near a session's
+        # end remaining reuse drops and protection stops paying; the client
+        # knows this from the DAG, the server does not.
+        self.min_remaining_reuse = min_remaining_reuse
         # Exact-coordinate calibration: base URL of a vLLM server exposing
         # /v1/chat/completions/render. When set, the datagen resolves each
         # directive boundary to exact materialized token positions before
@@ -68,10 +78,17 @@ class WorkflowAwarePolicy:
         self,
         reuse_depth_profile: Optional[list[ReuseSegment]],
         scope: Optional[str] = None,
+        remaining_reuse: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         profile = reuse_depth_profile
         # No profile → no directive (immediate LRU evict). Covers None and [].
         if not profile:
+            return None
+        # Emission gates: skip protection that would not pay for its budget slot.
+        if self.min_breadth and max(seg.breadth for seg in profile) < self.min_breadth:
+            return None
+        if (self.min_remaining_reuse and remaining_reuse is not None
+                and remaining_reuse < self.min_remaining_reuse):
             return None
         directives: list[dict[str, Any]] = [
             {
