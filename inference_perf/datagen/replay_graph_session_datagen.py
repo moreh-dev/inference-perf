@@ -428,7 +428,7 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                 payload["tool_choice"] = "required"
 
         if self.retention_policy is not None:
-            extra = self._compute_retention_extra_body()
+            extra = await self._compute_retention_extra_body(payload)
             if extra:
                 existing_extra = payload.get("extra_body") or {}
                 existing_extra.update(extra)
@@ -436,20 +436,121 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
 
         return payload
 
-    def _compute_retention_extra_body(self) -> Optional[Dict[str, Any]]:
-        """Invoke the retention policy with this event's reuse-depth profile to
-        build the extra_body retention_directives (None if no profile).
+    async def _compute_retention_extra_body(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build the extra_body retention_directives for this request.
 
-        The profile is computed in RECORDED-trace token coordinates; rescale it
-        into the materialized request's token space before deriving directives
-        (see _rescale_profile_to_materialized). _calibrate_profile_via_render is
-        the exact render-based alternative when a render endpoint is available."""
+        Primary path (policy.render_url set): forward-increment protection —
+        proactively protect the tokens THIS turn contributes that later turns
+        will reuse, their exact boundary measured via render + longest-common-
+        prefix (see _forward_reuse_directives). This bypasses the message-DAG
+        producer profile, which under-credits reuse (single best-predecessor +
+        leading-run matching leaves many reused producers with an empty profile
+        → no directive → the reused blocks fall to LRU).
+
+        Fallback (no render_url, or render failure): the legacy profile path —
+        char-ratio rescale of the producer reuse-depth profile.
+        """
+        if getattr(self.retention_policy, "render_url", None):
+            directives = await self._forward_reuse_directives(payload)
+            if directives is not None:
+                if not directives:
+                    return None  # request reuses nothing → no directive (LRU)
+                result: dict[str, Any] = {"retention_directives": directives}
+                scope = self._extract_session_id()
+                if scope is not None:
+                    result["retention_scope"] = scope
+                return result
+            # directives is None → render failed; fall through to legacy path.
         profile = self._rescale_profile_to_materialized(self.reuse_depth_profile)
         return self.retention_policy.compute_directives(
             reuse_depth_profile=profile,
             scope=self._extract_session_id(),
             remaining_reuse=self.remaining_reuse,
         )
+
+    async def _forward_reuse_directives(
+        self, payload: Dict[str, Any]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Proactively protect THIS turn's own NEW increment at exact coords.
+
+        A turn's prompt begins with the reused conversation history and ends
+        with its own new content (from its first `unique` segment) plus the
+        output it is about to generate. Render the inherited-history prefix and
+        the full request and take their longest common prefix (LCP): that depth
+        is where inherited history ends and this turn's new content begins in
+        the server's materialized token space. Protect [depth, prompt_len +
+        max_tokens) — the new prompt tail and the generated output.
+
+        Each turn protects ONLY its own increment, so every block is protected
+        exactly once, by the turn that produced it (no redundant re-protection
+        of the shared prefix), with breadth = how many later turns reuse it
+        (remaining_reuse). Because it is applied when the increment is created,
+        the block is protected before the next turn reuses it — closing the
+        producer→first-reuse window the incoming-prefix approach left to LRU.
+
+        Returns a one-element directives list, an empty list (nothing downstream
+        reuses this turn → no directive), or None on render failure (caller
+        falls back to the legacy profile path).
+        """
+        reuse = self.remaining_reuse or 0
+        if reuse <= 0:
+            return []  # this turn's content is never reused downstream → LRU
+        # Leading contiguous shared/output run = inherited history, up to this
+        # turn's first `unique` (its own new content).
+        shared_msgs = 0
+        for seg in self.input_segments:
+            if seg.type == "unique":
+                break
+            if seg.source_event_id is not None:
+                shared_msgs += seg.message_count
+        base_body: Dict[str, Any] = {
+            "model": payload.get("model"),
+            "messages": payload.get("messages") or [],
+            "max_tokens": 1,
+        }
+        if payload.get("tools"):
+            base_body["tools"] = payload["tools"]
+        try:
+            full_ids = await _render_token_ids(
+                self.retention_policy.render_url, base_body
+            )
+            if shared_msgs > 0:
+                prefix_body = dict(base_body)
+                prefix_body["messages"] = base_body["messages"][:shared_msgs]
+                prefix_ids = await _render_token_ids(
+                    self.retention_policy.render_url, prefix_body, cacheable=True
+                )
+            else:
+                prefix_ids = []  # first turn: no inherited history to skip
+        except Exception as e:
+            logger.warning(
+                "Event %s: forward-reuse render failed (%s); falling back to "
+                "profile path", self.event_id, e,
+            )
+            return None
+        if not full_ids or prefix_ids is None:
+            return None
+        # depth = inherited-history end = start of this turn's new content.
+        depth = _lcp_len(prefix_ids, full_ids)
+        prompt_len = len(full_ids)
+        out_cap = int(payload.get("max_tokens") or 0)
+        end = prompt_len + out_cap  # new prompt tail + generated output
+        if end <= depth:
+            return []
+        pol = self.retention_policy
+        breadth = max(reuse, 1)
+        # Protected once at the producer (never re-protected downstream), so the
+        # TTL must span until the FARTHEST reuse (~reuse turns away), not just a
+        # single idle gap.
+        duration = reuse * pol.per_span_s + pol.queue_margin_s + pol.ttl_buffer_s
+        return [
+            {
+                "start": depth,
+                "end": end,
+                "priority": pol._priority_for_breadth(breadth),
+                "duration": duration,
+            }
+        ]
 
     async def _calibrate_profile_via_render(
         self, payload: Dict[str, Any]
