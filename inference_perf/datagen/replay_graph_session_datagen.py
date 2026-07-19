@@ -87,6 +87,135 @@ def _prefix_reuse_counts(events) -> Dict[str, int]:
     return out
 
 
+def _live_msgs(ev, registry):
+    """ev's messages with RECORDED assistant outputs replaced by the LIVE
+    (actually-generated) outputs from the registry. The server caches/reuses the
+    LIVE conversation, not the trace: substituting past live outputs makes the
+    forward-reuse depth reflect what is actually shared/reused at serve time.
+    Falls back to the recorded message when a live output is not yet available
+    (future/own turns), so a turn's own not-yet-generated output stays as trace."""
+    msgs = ev.call.messages
+    if registry is None:
+        return msgs
+    segs = getattr(ev.call, "input_segments", None)
+    if not segs:
+        return msgs
+    out_msgs = []
+    cursor = 0
+    for seg in segs:
+        seg_msgs = msgs[cursor:cursor + seg.message_count]
+        sid = getattr(seg, "source_event_id", None)
+        if getattr(seg, "type", None) == "output" and seg.message_count == 1 and sid:
+            live = registry.get_message_by_event_id(sid)
+            if live is not None:
+                out_msgs.append(live)
+            else:
+                txt = registry.get_output_by_event_id(sid)
+                if txt is not None and seg_msgs:
+                    m = dict(seg_msgs[0])
+                    m["content"] = txt
+                    out_msgs.append(m)
+                else:
+                    out_msgs.extend(seg_msgs)
+        else:
+            out_msgs.extend(seg_msgs)
+        cursor += seg.message_count
+    if cursor < len(msgs):
+        out_msgs.extend(msgs[cursor:])
+    return out_msgs
+
+
+def _forward_reuse_depths(events, registry=None, target=None) -> Dict[str, Tuple[tuple, bool]]:
+    """Per event, the reuse-depth PROFILE + covers_output, TOKEN-granular.
+
+    Compares recorded message content directly (bypassing the segment
+    source_event_id attribution, which under-detects). The comparison set for a
+    turn is every LATER turn (forward reuse) plus its BACKWARD SIBLINGS — earlier
+    turns with an identical predecessor set, which cache the same shared prefix
+    concurrently and would otherwise leave it unprotected when this turn is a
+    reuse-chain leaf. Returns (segments, covers_output) where segments is a tuple
+    of (shared_msgs, partial_chars, breadth) ascending by depth:
+      - shared_msgs / partial_chars: a depth boundary — whole leading messages
+        plus a char-prefix of the first diverging message.
+      - breadth: how many comparison turns reuse this event's prompt AT LEAST
+        that deep. Shallower prefixes have higher breadth (more reusers), so
+        they get a higher priority tier.
+      - covers_output: a LATER event reuses this event's FULL prompt and extends
+        past it, so this event's generated output is reused too. Backward
+        siblings never set this (an earlier turn cannot consume this output).
+    Reuse is prefix-contiguous, so [messages[:shared_msgs] + first partial_chars
+    of the next message] is exactly a reused prefix; the client renders each
+    boundary and LCPs it against the full render to get the exact TOKEN depth."""
+    order = sorted(events, key=lambda e: float(getattr(e, "t_start_ms", 0) or 0))
+
+    def _txt(m: Dict[str, Any]) -> str:
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        return json.dumps(c, sort_keys=True, default=str) if c is not None else ""
+
+    def _key(m: Dict[str, Any]) -> tuple:
+        tc = m.get("tool_calls")
+        return (m.get("role"), _txt(m), json.dumps(tc, sort_keys=True, default=str) if tc else "")
+
+    msgs = [_live_msgs(ev, registry) for ev in order]
+    keys = [[_key(m) for m in ms] for ms in msgs]
+
+    def _boundary(i: int, j: int) -> Tuple[int, int]:
+        a, ka, na = msgs[i], keys[i], len(msgs[i])
+        b, kb = msgs[j], keys[j]
+        w = 0
+        for x, y in zip(ka, kb, strict=False):
+            if x == y:
+                w += 1
+            else:
+                break
+        p = 0
+        if w < na and w < len(b) and a[w].get("role") == b[w].get("role"):
+            ca, cb = _txt(a[w]), _txt(b[w])
+            lim = min(len(ca), len(cb))
+            while p < lim and ca[p] == cb[p]:
+                p += 1
+        return w, p
+
+    # Backward siblings = earlier turns with an IDENTICAL predecessor set. Roots
+    # (empty set) and non-graph events (missing attr) have no siblings, so the
+    # function reduces to forward-only for them.
+    pred_sets = [frozenset(getattr(ev, "predecessor_event_ids", ()) or ()) for ev in order]
+    sib_index: Dict[frozenset, List[int]] = {}
+    for j, ps in enumerate(pred_sets):
+        if ps:
+            sib_index.setdefault(ps, []).append(j)
+
+    out: Dict[str, Tuple[tuple, bool]] = {}
+    for i, ev in enumerate(order):
+        if target is not None and ev.event_id != target:
+            continue
+        na = len(msgs[i])
+        depths: List[Tuple[int, int]] = []
+        covers = False
+        for j in range(i + 1, len(order)):  # forward reuse
+            w, p = _boundary(i, j)
+            if w > 0 or p > 0:
+                depths.append((w, p))
+            if w >= na and len(msgs[j]) > na:  # later turn reuses full + extends
+                covers = True
+        for j in sib_index.get(pred_sets[i], ()):  # backward siblings only
+            if j >= i:
+                continue
+            w, p = _boundary(i, j)
+            if w > 0 or p > 0:
+                depths.append((w, p))
+        # Boundaries ascending -> breadth non-increasing -> priorities
+        # non-increasing across token positions (validator-safe).
+        segs = tuple(
+            (bw, bp, sum(1 for d in depths if d >= (bw, bp)))
+            for (bw, bp) in sorted(set(depths))
+        )
+        out[ev.event_id] = (segs, covers)
+    return out
+
+
 def _compute_reuse_profiles(events) -> Dict[str, List[ReuseSegment]]:
     """Build each producer's reuse-depth profile from consumers' input_segments.
 
@@ -371,6 +500,13 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     # 이 이벤트의 전체 프롬프트를 leading prefix로 재사용하는 이후 연속 이벤트 수
     # (첫 미포함에서 중단). = 시뮬레이터 fwd_reuse. 정책의 잔여재사용 게이트용.
     remaining_reuse: int = 0
+    # Forward per-DEPTH reuse profile of THIS event's prompt (token-granular),
+    # from _forward_reuse_depths: a tuple of (shared_msgs, partial_chars,
+    # breadth) segments ascending by depth (breadth = #later turns reusing >=
+    # that depth), plus whether the output is reused. Each depth-range is
+    # protected at a priority tier set by its own breadth.
+    forward_segments: tuple = ()
+    forward_covers_output: bool = False
     registry: EventOutputRegistry
     worker_tracker: WorkerSessionTracker
     completion_queue: Any
@@ -471,38 +607,31 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
     async def _forward_reuse_directives(
         self, payload: Dict[str, Any]
     ) -> Optional[List[Dict[str, Any]]]:
-        """Proactively protect THIS turn's own NEW increment at exact coords.
+        """Protect the forward-reused prefix of THIS turn's prompt at the exact
+        TOKEN boundary (start=0), plus its output when the output is reused.
 
-        A turn's prompt begins with the reused conversation history and ends
-        with its own new content (from its first `unique` segment) plus the
-        output it is about to generate. Render the inherited-history prefix and
-        the full request and take their longest common prefix (LCP): that depth
-        is where inherited history ends and this turn's new content begins in
-        the server's materialized token space. Protect [depth, prompt_len +
-        max_tokens) — the new prompt tail and the generated output.
+        _forward_reuse_depths (from recorded messages, bypassing the segment
+        attribution) gives the deepest prefix of this turn's OWN prompt that some
+        later turn reuses: forward_shared_msgs whole leading messages plus
+        forward_partial_chars of the first diverging message (sub-message /
+        token-level reuse). Render that prefix and the full prompt and take their
+        LCP → the exact materialized token boundary D. Protect [0, D); if
+        forward_covers_output, add a covers_output directive (server resolves it
+        to the generated-output range).
 
-        Each turn protects ONLY its own increment, so every block is protected
-        exactly once, by the turn that produced it (no redundant re-protection
-        of the shared prefix), with breadth = how many later turns reuse it
-        (remaining_reuse). Because it is applied when the increment is created,
-        the block is protected before the next turn reuses it — closing the
-        producer→first-reuse window the incoming-prefix approach left to LRU.
+        Every turn re-protects the prefix it still carries downstream (start=0),
+        so the reused conversation prefix stays retained (TTL refreshed) while a
+        turn's non-reused tail is left to LRU. Prompt-centric and block-granular:
+        a turn protects reused tokens even where an earlier turn produced them.
 
-        Returns a one-element directives list, an empty list (nothing downstream
-        reuses this turn → no directive), or None on render failure (caller
-        falls back to the legacy profile path).
+        Returns the directives ([] = nothing reused downstream), or None on
+        render failure (caller falls back to the legacy profile path).
         """
-        reuse = self.remaining_reuse or 0
-        if reuse <= 0:
-            return []  # this turn's content is never reused downstream → LRU
-        # Leading contiguous shared/output run = inherited history, up to this
-        # turn's first `unique` (its own new content).
-        shared_msgs = 0
-        for seg in self.input_segments:
-            if seg.type == "unique":
-                break
-            if seg.source_event_id is not None:
-                shared_msgs += seg.message_count
+        segs = self.forward_segments
+        covers_out = self.forward_covers_output
+        if not segs and not covers_out:
+            logger.info("[FWD] ev=%s no forward reuse -> skip", self.event_id)
+            return []
         base_body: Dict[str, Any] = {
             "model": payload.get("model"),
             "messages": payload.get("messages") or [],
@@ -510,47 +639,74 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         }
         if payload.get("tools"):
             base_body["tools"] = payload["tools"]
+        messages = base_body["messages"]
+        pol = self.retention_policy
         try:
-            full_ids = await _render_token_ids(
-                self.retention_policy.render_url, base_body
-            )
-            if shared_msgs > 0:
-                prefix_body = dict(base_body)
-                prefix_body["messages"] = base_body["messages"][:shared_msgs]
-                prefix_ids = await _render_token_ids(
-                    self.retention_policy.render_url, prefix_body, cacheable=True
-                )
-            else:
-                prefix_ids = []  # first turn: no inherited history to skip
+            full_ids = await _render_token_ids(pol.render_url, base_body)
         except Exception as e:
             logger.warning(
                 "Event %s: forward-reuse render failed (%s); falling back to "
                 "profile path", self.event_id, e,
             )
             return None
-        if not full_ids or prefix_ids is None:
+        if not full_ids:
             return None
-        # depth = inherited-history end = start of this turn's new content.
-        depth = _lcp_len(prefix_ids, full_ids)
-        prompt_len = len(full_ids)
-        out_cap = int(payload.get("max_tokens") or 0)
-        end = prompt_len + out_cap  # new prompt tail + generated output
-        if end <= depth:
-            return []
-        pol = self.retention_policy
-        breadth = max(reuse, 1)
-        # Protected once at the producer (never re-protected downstream), so the
-        # TTL must span until the FARTHEST reuse (~reuse turns away), not just a
-        # single idle gap.
-        duration = reuse * pol.per_span_s + pol.queue_margin_s + pol.ttl_buffer_s
-        return [
-            {
-                "start": depth,
-                "end": end,
-                "priority": pol._priority_for_breadth(breadth),
-                "duration": duration,
-            }
-        ]
+        # One directive per depth-range; priority tiered by THAT range's breadth.
+        # Segments ascending in depth with non-increasing breadth -> priorities
+        # non-increasing across token positions (prefix-cache validator-safe).
+        directives: List[Dict[str, Any]] = []
+        prev = 0
+        last_breadth = 1
+        for (w, p, breadth) in segs:
+            pref_msgs = list(messages[:w])
+            if p > 0 and w < len(messages):
+                dm = messages[w]
+                c = dm.get("content") if isinstance(dm, dict) else None
+                if isinstance(c, str) and c:
+                    pref_msgs.append({**dm, "content": c[:p]})
+            if not pref_msgs:
+                continue
+            try:
+                prefix_body = dict(base_body)
+                prefix_body["messages"] = pref_msgs
+                prefix_ids = await _render_token_ids(
+                    pol.render_url, prefix_body, cacheable=True
+                )
+            except Exception as e:
+                logger.warning(
+                    "Event %s: forward-reuse render failed (%s); falling back to "
+                    "profile path", self.event_id, e,
+                )
+                return None
+            if prefix_ids is None:
+                return None
+            depth = _lcp_len(prefix_ids, full_ids)
+            if depth > prev:
+                directives.append({
+                    "start": prev,
+                    "end": depth,
+                    "priority": pol._priority_for_breadth(breadth),
+                    "duration": (
+                        breadth * pol.per_span_s
+                        + pol.queue_margin_s + pol.ttl_buffer_s
+                    ),
+                })
+                prev = depth
+                last_breadth = breadth
+        if covers_out:
+            directives.append({
+                "covers_output": True,
+                "priority": pol._priority_for_breadth(last_breadth),
+                "duration": (
+                    last_breadth * pol.per_span_s
+                    + pol.queue_margin_s + pol.ttl_buffer_s
+                ),
+            })
+        logger.info(
+            "[FWD] ev=%s nsegs=%d covers_out=%s dirs=%d depth=%d",
+            self.event_id, len(segs), covers_out, len(directives), prev,
+        )
+        return directives
 
     async def _calibrate_profile_via_render(
         self, payload: Dict[str, Any]
@@ -1634,6 +1790,7 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         retention_policy = getattr(self, "retention_policy", None)
 
         remaining_reuse = 0
+        fwd_segs, fwd_covers = (), False
         if state and raw_event_id in state.graph.events:
             cache = getattr(self, "_reuse_count_cache", None)
             if cache is None:
@@ -1644,6 +1801,16 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
                 rc = _prefix_reuse_counts(list(state.graph.events.values()))
                 cache[session_id] = rc
             remaining_reuse = rc.get(raw_event_id, 0)
+            # LIVE-based forward reuse: recompute for THIS turn using the live
+            # (actually-generated) outputs recorded so far, not the trace outputs.
+            # Not cached per-session because the live substitution changes as each
+            # predecessor completes; target= keeps it to this turn's row (O(N)).
+            fd = _forward_reuse_depths(
+                list(state.graph.events.values()),
+                registry=getattr(self, "output_registry", None),
+                target=raw_event_id,
+            )
+            fwd_segs, fwd_covers = fd.get(raw_event_id, ((), False))
 
         return SessionChatCompletionAPIData(
             messages=chat_messages,
@@ -1651,6 +1818,8 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
             tool_definitions=event.tool_definitions,
             event_id=event.event_id,
             remaining_reuse=remaining_reuse,
+            forward_segments=fwd_segs,
+            forward_covers_output=fwd_covers,
             registry=self.output_registry,
             worker_tracker=getattr(self, "worker_tracker", WorkerSessionTracker()),
             completion_queue=getattr(self, "session_completion_queue", None),
