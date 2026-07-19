@@ -640,7 +640,6 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
         segs = self.forward_segments
         covers_out = self.forward_covers_output
         if not segs and not covers_out:
-            logger.info("[FWD] ev=%s no forward reuse -> skip", self.event_id)
             return []
         base_body: Dict[str, Any] = {
             "model": payload.get("model"),
@@ -712,10 +711,6 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                     + pol.queue_margin_s + pol.ttl_buffer_s
                 ),
             })
-        logger.info(
-            "[FWD] ev=%s nsegs=%d covers_out=%s dirs=%d depth=%d",
-            self.event_id, len(segs), covers_out, len(directives), prev,
-        )
         return directives
 
     async def _calibrate_profile_via_render(
