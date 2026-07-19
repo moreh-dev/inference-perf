@@ -130,10 +130,10 @@ def _forward_reuse_depths(events, registry=None, target=None) -> Dict[str, Tuple
 
     Compares recorded message content directly (bypassing the segment
     source_event_id attribution, which under-detects). The comparison set for a
-    turn is every LATER turn (forward reuse) plus its BACKWARD SIBLINGS — earlier
-    turns with an identical predecessor set, which cache the same shared prefix
-    concurrently and would otherwise leave it unprotected when this turn is a
-    reuse-chain leaf. Returns (segments, covers_output) where segments is a tuple
+    turn is every NON-ANCESTOR turn (all later turns plus backward cross-branch
+    turns), excluding only its own lineage; cross-branch cousins can share a deep
+    prefix the causal graph does not link, which would otherwise be left
+    unprotected. Returns (segments, covers_output) where segments is a tuple
     of (shared_msgs, partial_chars, breadth) ascending by depth:
       - shared_msgs / partial_chars: a depth boundary — whole leading messages
         plus a char-prefix of the first diverging message.
@@ -178,14 +178,27 @@ def _forward_reuse_depths(events, registry=None, target=None) -> Dict[str, Tuple
                 p += 1
         return w, p
 
-    # Backward siblings = earlier turns with an IDENTICAL predecessor set. Roots
-    # (empty set) and non-graph events (missing attr) have no siblings, so the
-    # function reduces to forward-only for them.
-    pred_sets = [frozenset(getattr(ev, "predecessor_event_ids", ()) or ()) for ev in order]
-    sib_index: Dict[frozenset, List[int]] = {}
-    for j, ps in enumerate(pred_sets):
-        if ps:
-            sib_index.setdefault(ps, []).append(j)
+    # Comparison set = every NON-ANCESTOR turn (forward turns + backward
+    # cross-branch turns), excluding only this turn's own lineage. Ancestors are
+    # upstream and share only a shallow prefix; cross-branch cousins can share a
+    # deep prefix the causal graph does not link, and leaving that uncovered lets
+    # a same-scope turn owner-clear the owner's protection.
+    _eid2idx = {getattr(ev, "event_id", None): j for j, ev in enumerate(order)}
+    _idx_preds = [
+        [_eid2idx[p] for p in (getattr(ev, "predecessor_event_ids", ()) or ()) if p in _eid2idx]
+        for ev in order
+    ]
+
+    def _ancestors(i: int) -> set:
+        seen: set = set()
+        stack = list(_idx_preds[i])
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            stack.extend(_idx_preds[x])
+        return seen
 
     out: Dict[str, Tuple[tuple, bool]] = {}
     for i, ev in enumerate(order):
@@ -194,18 +207,15 @@ def _forward_reuse_depths(events, registry=None, target=None) -> Dict[str, Tuple
         na = len(msgs[i])
         depths: List[Tuple[int, int]] = []
         covers = False
-        for j in range(i + 1, len(order)):  # forward reuse
-            w, p = _boundary(i, j)
-            if w > 0 or p > 0:
-                depths.append((w, p))
-            if w >= na and len(msgs[j]) > na:  # later turn reuses full + extends
-                covers = True
-        for j in sib_index.get(pred_sets[i], ()):  # backward siblings only
-            if j >= i:
+        anc = _ancestors(i)
+        for j in range(len(order)):  # all non-ancestor turns
+            if j == i or j in anc:
                 continue
             w, p = _boundary(i, j)
             if w > 0 or p > 0:
                 depths.append((w, p))
+            if j > i and w >= na and len(msgs[j]) > na:  # covers_output: forward only
+                covers = True
         # Boundaries ascending -> breadth non-increasing -> priorities
         # non-increasing across token positions (validator-safe).
         segs = tuple(
